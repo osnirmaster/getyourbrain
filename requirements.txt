@@ -1,0 +1,3 @@
+strands-agents[anthropic,ollama]>=1.61
+mcp>=2.1
+python-dotenv>=1.0

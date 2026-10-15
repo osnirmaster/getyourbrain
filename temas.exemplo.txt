@@ -1,0 +1,4 @@
+# Um tema de negócio por linha. Comece pequeno: um domínio só.
+limites de transação PIX (diurno, noturno, por chave)
+cálculo de tarifas de TED
+regras de bloqueio cautelar
