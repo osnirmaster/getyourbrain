@@ -1,0 +1,147 @@
+// pkg/importflow/source_csv.go
+package importflow
+
+import (
+	"context"
+	"encoding/csv"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+)
+
+// CSVOptions configures a CSVSource.
+type CSVOptions struct {
+	Table      string // logical table name; default "csv"
+	Delimiter  rune   // default ','
+	SampleSize int    // sample rows in Schemas(); default 5
+}
+
+// CSVSource is an in-memory Source over a single CSV stream (header required).
+type CSVSource struct {
+	table      string
+	columns    []Column
+	records    []Record
+	sampleSize int
+}
+
+// NewCSVSource eagerly reads the whole CSV into memory and infers column types.
+func NewCSVSource(r io.Reader, opts CSVOptions) (*CSVSource, error) {
+	if opts.Delimiter == 0 {
+		opts.Delimiter = ','
+	}
+	if opts.SampleSize <= 0 {
+		opts.SampleSize = 5
+	}
+	if opts.Table == "" {
+		opts.Table = "csv"
+	}
+	cr := csv.NewReader(r)
+	cr.Comma = opts.Delimiter
+	cr.FieldsPerRecord = -1
+	raw, err := cr.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("read csv: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty csv: no header row")
+	}
+	header := raw[0]
+	// Two columns under one name would share a map key and one would vanish,
+	// so a duplicate is an error. An empty name is not: a trailing comma on
+	// the header line is common in exported CSVs, and the column it makes is
+	// kept as column_<n> (1-based). The named columns are collected first so
+	// a generated name cannot shadow a real one.
+	cols := make([]Column, len(header))
+	seen := make(map[string]bool, len(header))
+	for i, h := range header {
+		name := strings.TrimSpace(h)
+		if name == "" {
+			continue
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate csv header column %q", name)
+		}
+		seen[name] = true
+		cols[i] = Column{Name: name}
+	}
+	for i := range cols {
+		if cols[i].Name != "" {
+			continue
+		}
+		name := fmt.Sprintf("column_%d", i+1)
+		if seen[name] {
+			return nil, fmt.Errorf("csv header column %d is empty and its default name %q is taken", i+1, name)
+		}
+		seen[name] = true
+		cols[i] = Column{Name: name}
+	}
+	var recs []Record
+	for ri, row := range raw[1:] {
+		vals := make(map[string]string, len(cols))
+		nulls := make(map[string]bool)
+		for ci, c := range cols {
+			if ci < len(row) {
+				vals[c.Name] = row[ci]
+			} else {
+				nulls[c.Name] = true
+			}
+		}
+		recs = append(recs, Record{Table: opts.Table, Values: vals, Nulls: nulls, Row: ri})
+	}
+	inferColumnTypes(cols, recs)
+	return &CSVSource{table: opts.Table, columns: cols, records: recs, sampleSize: opts.SampleSize}, nil
+}
+
+func (s *CSVSource) Schemas(_ context.Context) ([]Schema, error) {
+	n := s.sampleSize
+	if n > len(s.records) {
+		n = len(s.records)
+	}
+	return []Schema{{Table: s.table, Columns: s.columns, Sample: s.records[:n]}}, nil
+}
+
+func (s *CSVSource) Records(ctx context.Context, fn func(Record) error) error {
+	for _, r := range s.records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *CSVSource) Close() error { return nil }
+
+// inferColumnTypes assigns a best-effort Type to each column from its values.
+func inferColumnTypes(cols []Column, recs []Record) {
+	for i := range cols {
+		name := cols[i].Name
+		allInt, allFloat, seen := true, true, false
+		for _, r := range recs {
+			v, ok := r.Get(name)
+			if !ok || v == "" {
+				continue
+			}
+			seen = true
+			if _, err := strconv.ParseInt(v, 10, 64); err != nil {
+				allInt = false
+			}
+			if _, err := strconv.ParseFloat(v, 64); err != nil {
+				allFloat = false
+			}
+		}
+		switch {
+		case !seen:
+			cols[i].Type = ""
+		case allInt:
+			cols[i].Type = "integer"
+		case allFloat:
+			cols[i].Type = "number"
+		default:
+			cols[i].Type = "text"
+		}
+	}
+}

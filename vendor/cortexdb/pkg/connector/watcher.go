@@ -1,0 +1,213 @@
+package connector
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"sort"
+
+	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
+	"github.com/liliang-cn/cortexdb/v2/pkg/graph"
+	"github.com/liliang-cn/cortexdb/v2/pkg/importflow"
+)
+
+// WatcherOptions configures a Watcher.
+type WatcherOptions struct {
+	// SourceKey is the stable checkpoint key for this (source, tableset).
+	SourceKey string
+	// Desensitizer applies the signed MaskingPlan. Required.
+	Desensitizer *Desensitizer
+	// Mapping routes rows to RAG/KG. Required; every RAG table MUST set IDColumn
+	// and KG delete targets MUST key on the primary key (validated).
+	Mapping importflow.MappingPlan
+	// Checkpoint persists resume position. Required.
+	Checkpoint CheckpointStore
+	// Columns gives each table's column list for the one-row import source. If a
+	// table is absent, columns are inferred from the event row's value keys.
+	Columns map[string][]importflow.Column
+}
+
+// Watcher consumes ChangeEvents and keeps RAG + KG in sync with the source.
+type Watcher struct {
+	db   *cortexdb.DB
+	src  ChangeSource
+	opts WatcherOptions
+	im   *importflow.Importer
+}
+
+// cursorCheckpointer is implemented by polling-style sources that track a
+// per-table watermark cursor (Route A). Log-based sources (Route B) will
+// implement a position-based checkpointer instead.
+type cursorCheckpointer interface {
+	LoadWatermarks(cursor string) error
+	WatermarkJSON() (string, error)
+}
+
+// positionCheckpointer is implemented by log-based sources (Route B: PG logical
+// replication, MySQL binlog) that resume from an opaque position token (LSN /
+// binlog position) carried on each ChangeEvent.Position.
+type positionCheckpointer interface {
+	LoadPosition(pos string) error
+}
+
+// NewWatcher validates options (incl. the stable-key precondition) and returns a
+// Watcher. It does not start consuming until Run.
+func NewWatcher(db *cortexdb.DB, src ChangeSource, opts WatcherOptions) (*Watcher, error) {
+	if opts.Desensitizer == nil {
+		return nil, fmt.Errorf("connector: watcher requires a Desensitizer")
+	}
+	if opts.Checkpoint == nil {
+		return nil, fmt.Errorf("connector: watcher requires a CheckpointStore")
+	}
+	if opts.SourceKey == "" {
+		return nil, fmt.Errorf("connector: watcher requires a SourceKey")
+	}
+	for table, tp := range opts.Mapping.Tables {
+		if tp.RAG != nil && tp.RAG.IDColumn == "" {
+			return nil, fmt.Errorf("connector: table %q routes to RAG without RAGPlan.IDColumn; CDC needs a stable key", table)
+		}
+	}
+	return &Watcher{db: db, src: src, opts: opts, im: importflow.New(db)}, nil
+}
+
+// Run consumes changes until the source's Changes returns (polling: one batch;
+// log-based: until ctx is cancelled), applying each event. For cursor-based
+// sources it seeds the watermark from the checkpoint before draining and saves
+// the advanced watermark after a successful drain.
+func (w *Watcher) Run(ctx context.Context) error {
+	// Seed resume position from the checkpoint.
+	cp, found, err := w.opts.Checkpoint.Load(ctx, w.opts.SourceKey)
+	if err != nil {
+		return err
+	}
+	if found {
+		if cc, ok := w.src.(cursorCheckpointer); ok {
+			if err := cc.LoadWatermarks(cp.Cursor); err != nil {
+				return err
+			}
+		}
+		if pc, ok := w.src.(positionCheckpointer); ok {
+			if err := pc.LoadPosition(cp.Position); err != nil {
+				return err
+			}
+		}
+	}
+
+	_, isPosition := w.src.(positionCheckpointer)
+	if err := w.src.Changes(ctx, func(e ChangeEvent) error {
+		if err := w.apply(ctx, e); err != nil {
+			return err
+		}
+		// Position-based sources checkpoint after each applied event (at-least-once;
+		// apply is idempotent, so a replayed event on restart is safe).
+		if isPosition && e.Position != "" {
+			return w.opts.Checkpoint.Save(ctx, w.opts.SourceKey, Checkpoint{Position: e.Position})
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Cursor-based sources checkpoint the advanced watermark after a full drain.
+	if cc, ok := w.src.(cursorCheckpointer); ok {
+		cursor, err := cc.WatermarkJSON()
+		if err != nil {
+			return err
+		}
+		return w.opts.Checkpoint.Save(ctx, w.opts.SourceKey, Checkpoint{Cursor: cursor})
+	}
+	return nil
+}
+
+func (w *Watcher) apply(ctx context.Context, e ChangeEvent) error {
+	switch e.Op {
+	case OpInsert, OpUpdate:
+		return w.applyUpsert(ctx, e)
+	case OpDelete:
+		return w.applyDelete(ctx, e)
+	default:
+		return fmt.Errorf("connector: unknown change op %d", e.Op)
+	}
+}
+
+// applyUpsert desensitizes the row and runs it through importflow as a one-row
+// source, which upserts by KnowledgeID (RAGPlan.IDColumn) and idempotent IRIs.
+func (w *Watcher) applyUpsert(ctx context.Context, e ChangeEvent) error {
+	cols := w.opts.Columns[e.Table]
+	if cols == nil {
+		cols = columnsFromRecord(e.Row)
+	}
+	src := Desensitized(singleRowSource(e.Table, cols, e.Row), w.opts.Desensitizer)
+	_, err := w.im.Run(ctx, src, w.opts.Mapping)
+	return err
+}
+
+// applyDelete removes the row's RAG chunk and entity triples. The key is
+// desensitized first so a pseudonymized key resolves to the same token that was
+// indexed.
+func (w *Watcher) applyDelete(ctx context.Context, e ChangeEvent) error {
+	dkey, err := w.desensitizeKey(ctx, e.Table, e.Key)
+	if err != nil {
+		return err
+	}
+	tp := w.opts.Mapping.Tables[e.Table]
+
+	if tp.RAG != nil {
+		if id := ragChunkID(e.Table, tp.RAG, dkey); id != "" {
+			if _, err := w.db.DeleteKnowledge(ctx, cortexdb.KnowledgeDeleteRequest{KnowledgeID: id}); err != nil {
+				return err
+			}
+		}
+	}
+	if tp.KG != nil {
+		for _, iri := range entityIRIsForKey(tp.KG, dkey) {
+			if err := w.deleteEntity(ctx, iri); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// deleteEntity removes all triples where iri is subject (type/label/props/outgoing
+// relations) and where it is object (incoming relations), leaving no dangling edge.
+func (w *Watcher) deleteEntity(ctx context.Context, iri string) error {
+	subj := graph.NewIRI(iri)
+	if _, err := w.db.DeleteKnowledgeGraph(ctx, cortexdb.KnowledgeGraphDeleteRequest{
+		Pattern: &cortexdb.KnowledgeGraphTriplePattern{Subject: &subj},
+	}); err != nil {
+		return err
+	}
+	obj := graph.NewIRI(iri)
+	if _, err := w.db.DeleteKnowledgeGraph(ctx, cortexdb.KnowledgeGraphDeleteRequest{
+		Pattern: &cortexdb.KnowledgeGraphTriplePattern{Object: &obj},
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// desensitizeKey runs the key columns through the desensitizer so reversible keys
+// become the same token used at index time.
+func (w *Watcher) desensitizeKey(ctx context.Context, table string, key map[string]string) (map[string]string, error) {
+	rec := importflow.Record{Table: table, Values: map[string]string{}, Nulls: map[string]bool{}}
+	maps.Copy(rec.Values, key)
+	out, err := w.opts.Desensitizer.Apply(ctx, rec)
+	if err != nil {
+		return nil, err
+	}
+	return out.Values, nil
+}
+
+func columnsFromRecord(r importflow.Record) []importflow.Column {
+	names := make([]string, 0, len(r.Values))
+	for name := range r.Values {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic column order
+	cols := make([]importflow.Column, 0, len(names))
+	for _, name := range names {
+		cols = append(cols, importflow.Column{Name: name})
+	}
+	return cols
+}

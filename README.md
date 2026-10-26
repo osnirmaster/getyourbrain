@@ -2,72 +2,71 @@
 
 Base de conhecimento de regras de negócio.
 
-Agentes de IA que respondem dúvidas sobre regras de negócio e geram diagramas
-a partir de repositórios de código e documentação. Toda resposta traz a fonte (arquivo:linha).
+O Claude Code responde dúvidas sobre regras de negócio e gera diagramas a partir de repositórios de código e documentação. Toda resposta traz a fonte (arquivo:linha). O projeto é autocontido: busca e grafo rodam na máquina, sem enviar dados para fora e sem API key própria (usa o login do Claude Code).
 
 ## Arquitetura
 
 ```mermaid
 flowchart LR
-    R[Repositórios + docs<br/>código, PDF, DOCX, MD] -->|xerj autoindex| X[(xerj<br/>busca híbrida + código)]
-    X -->|curar_grafo.py| C[(CortexDB<br/>grafo de regras)]
-    X -- MCP --> S[Strands Agents]
+    R[Repositórios + docs<br/>código, PDF, DOCX, MD] -->|/indexar| X[(xerj<br/>busca híbrida + código)]
+    X -->|/curar| C[(CortexDB<br/>grafo de regras)]
+    X -- MCP --> S[Claude Code<br/>subagentes]
     C -- MCP --> S
-    S --> U[perguntar.py<br/>respostas + diagramas Mermaid]
+    S --> U[/perguntar<br/>respostas + diagramas Mermaid/]
 ```
 
-| Peça | Papel | Por quê |
-|---|---|---|
-| **xerj** | Indexa o material bruto (código com tree-sitter, PDF, DOCX, XLSX…) e faz busca full-text, vetorial e híbrida com `arquivo:linha` | Resolve a ingestão, que o CortexDB não tem pronta |
-| **CortexDB** | Guarda o conhecimento *curado*: regras, serviços, tabelas e as relações entre eles | O grafo permite análise de impacto e diagramas confiáveis |
-| **Strands Agents** | Orquestra os agentes e fala com os dois servidores via MCP | Suporta Bedrock, Anthropic e Ollama, com guardrails e observabilidade |
+| Peça | Papel |
+|---|---|
+| **xerj** (`vendor/xerj`) | Indexa o material bruto (código com tree-sitter, PDF, DOCX, XLSX…) e faz busca full-text, vetorial e híbrida com `arquivo:linha` |
+| **CortexDB** (`vendor/cortexdb`) | Guarda o conhecimento *curado*: regras, serviços, tabelas e as relações entre eles |
+| **Claude Code** | Orquestra os subagentes e fala com os dois servidores via MCP (`.mcp.json`) |
 
-### Agentes
+Os dois servidores são compilados do código em `vendor/`, com todas as funções que enviavam dados para fora removidas. Eles rodam com ambiente limpo e, no macOS, dentro de um sandbox sem rede externa. Detalhes em [`vendor/README.md`](vendor/README.md).
 
-- **orquestrador**: recebe a pergunta e delega aos especialistas.
+### Subagentes (`.claude/agents/`)
+
 - **pesquisador**: busca no xerj (só leitura).
-- **cartógrafo**: consulta o grafo no CortexDB (só leitura).
+- **cartografo**: consulta o grafo no CortexDB (só leitura).
 - **diagramador**: gera Mermaid usando apenas fatos com fonte.
-- **curador** (`curar_grafo.py`): lê o código via xerj e grava regras e relações no grafo. É o único agente que escreve.
+- **curador**: lê o código via xerj e grava regras e relações no grafo. É o único que escreve.
+
+A sessão principal do Claude Code faz o papel de orquestrador, seguindo `/perguntar`.
 
 ## Instalação
 
-1. **xerj**: siga a instalação no [repositório do projeto](https://github.com/xerj-org/xerj). Em banco, prefira baixar o binário do GitHub Releases e validar o checksum em vez de usar `curl | sh`.
-2. **CortexDB MCP**: baixe o binário `cortexdb-mcp` do [GitHub Releases](https://github.com/liliang-cn/cortexdb/releases) e rode `cortexdb-mcp --doctor --self-test`.
-3. **Python** (3.10 ou mais novo):
-   ```bash
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   cp .env.example .env   # ajuste provedor, modelo e caminhos dos binários
-   ```
+Precisa de Rust (`cargo`), Go e Claude Code.
+
+```bash
+scripts/build.sh   # compila xerj e cortexdb em bin/ e roda a verificação de isolamento
+```
+
+A primeira compilação do xerj leva cerca de 10 minutos. As dependências vêm do crates.io e do proxy do Go, travadas por `Cargo.lock` e `go.sum`. Depois de compilado, nada mais acessa a rede.
 
 ## Uso
 
-```bash
-# 1. Sobe o xerj com autenticação e indexa o material
-scripts/subir_xerj.sh ~/repos/servico-pix ~/docs/regras-pix
+Abra o Claude Code **na raiz do projeto** (o `.mcp.json` usa caminhos relativos):
 
-# 2. Confere quais ferramentas MCP cada servidor expõe
-python perguntar.py --ferramentas
-
-# 3. Cataloga regras de um domínio no grafo
-python curar_grafo.py --arquivo temas.exemplo.txt
-
-# 4. Faz perguntas (diagramas Mermaid são salvos em saida/)
-python perguntar.py "Qual o limite do PIX noturno e onde ele é validado?"
-python perguntar.py "Gere um diagrama de sequência do fluxo de PIX agendado"
-python perguntar.py   # modo interativo
+```text
+/indexar ~/repos/servico-pix ~/docs/regras-pix
+/curar --arquivo temas.exemplo.txt
+/perguntar Qual o limite do PIX noturno e onde ele é validado?
+/perguntar Gere um diagrama de sequência do fluxo de PIX agendado
 ```
+
+O xerj sobe sozinho quando o Claude Code inicia o servidor MCP. Os diagramas são salvos em `saida/`. Também dá para perguntar direto, sem o comando; as regras do `CLAUDE.md` valem do mesmo jeito.
+
+Para conferir o isolamento a qualquer momento: `scripts/verificar_isolamento.sh`.
 
 ## Pontos a validar
 
-- **Nomes das ferramentas MCP.** As listas em `servidores_mcp.py` vêm da documentação dos projetos. Se `--ferramentas` mostrar nomes diferentes, ajuste as listas. O script avisa quando falta alguma.
-- **ID do modelo no Bedrock.** Confira no console qual ID ou perfil de inferência do Claude está liberado na conta.
 - **Formato do `knowledge_graph_upsert`.** O curador segue o esquema que o próprio servidor MCP descreve. Revise as primeiras gravações com `serve_graph_3d` ou consultas SPARQL.
+- **Busca semântica.** Sem download de modelo, o xerj usa o embedder léxico. Para o neural, veja `vendor/README.md`.
 
 ## Segurança (ambiente bancário)
 
-- Nunca rode o xerj com `--insecure` fora da sua máquina. O script sobe com autenticação e o nó escuta só em `127.0.0.1`.
-- O rerank externo do xerj (Jev) envia trechos para servidores de terceiros. Ele vem desligado e o GetYourBrain não o usa.
-- O código vai para o provedor do modelo. Use Bedrock na conta do banco (com `BEDROCK_GUARDRAIL_ID`) ou Ollama local, conforme a política de segurança da informação.
-- `dados/`, `saida/` e `.env` estão no `.gitignore`.
+- O xerj sobe com autenticação e escuta só em `127.0.0.1`. A chave fica em `dados/xerj/admin.key`.
+- Rerank externo, embeddings por proxy, Corpus Hub, relatórios automáticos, túnel público e S3 foram removidos do código, não só desligados.
+- O CortexDB só conecta em loopback, mesmo que `OPENAI_API_KEY` ou outras chaves estejam no seu shell.
+- O projeto bloqueia WebFetch e WebSearch (`.claude/settings.json`).
+- **O que ainda sai:** as perguntas e os trechos encontrados vão para o modelo do Claude Code, como em qualquer sessão. Confira com a segurança da informação se o plano contratado atende à política do banco.
+- `bin/`, `dados/` e `saida/` estão no `.gitignore`.

@@ -1,0 +1,213 @@
+package rpcserver
+
+import (
+	"context"
+	"strings"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/liliang-cn/cortexdb/v2/pkg/authz"
+	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
+	rpcv1 "github.com/liliang-cn/cortexdb/v2/pkg/rpc/v1"
+)
+
+// nestedScanDepth bounds the walk for nested copies of a scope field. Nothing
+// in cortexdb.v1 nests scope fields deeper than RetrievalPlan.filters, two
+// levels down; the bound is here so a future recursive message cannot turn an
+// authorisation check into an unbounded walk of an attacker-shaped payload.
+const nestedScanDepth = 4
+
+// authInterceptor enforces the key policy on every RPC: the bearer secret
+// identifies a key, the key's clearance decides whether it may invoke the
+// method, and the key's scope decides whether it may touch the rows the request
+// names. A nil or empty key set disables authentication, which is what an unset
+// token has always meant.
+func authInterceptor(keys *authz.KeySet, db *cortexdb.DB) grpc.UnaryServerInterceptor {
+	return authInterceptorFrom(authz.StaticKeySource(keys), db)
+}
+
+// authInterceptorFrom is authInterceptor over the key set src holds at each
+// call, so a key file is applied as it stands now.
+func authInterceptorFrom(src *authz.KeySource, db *cortexdb.DB) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		keys := src.Current()
+		if !keys.Enabled() {
+			return handler(ctx, req)
+		}
+		secret, err := bearerSecret(ctx)
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keys.Lookup(secret)
+		if !ok {
+			// Deliberately the same message whether the secret was never
+			// valid or has since been revoked out of the key file: telling
+			// them apart tells a prober which guesses were once right.
+			return nil, status.Error(codes.Unauthenticated, "invalid token")
+		}
+		// Known from here on, whatever the policy says next: a denied call
+		// is logged under the key that asked, which is the line an operator
+		// reads when a scope is too narrow or a key is being probed.
+		tagCaller(ctx, key.ID)
+		// A tool call's arguments are JSON the policy below reads into a map
+		// and the tool decodes into a struct. For a key the policy reads the
+		// arguments for, both must read one value per field, so a call that
+		// names a field twice is refused here (authz.CheckUnambiguous).
+		if call, ok := req.(*rpcv1.CallToolRequest); ok && key.ReadsBody() {
+			if err := authz.CheckUnambiguous([]byte(call.GetArgsJson())); err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+		}
+		// AuthorizeCall rather than AuthorizeMethod: the interceptor can read
+		// the request, so it can tell the policy which tool a CallTool names
+		// and get the classification of that tool instead of the blanket one.
+		//
+		// sparqlAccess is the same idea one level deeper, and the only place a
+		// classification is computed rather than looked up: SPARQL is statically
+		// a write because the subset executes updates, and this narrows it to a
+		// read when the executor's own parser says the query does not mutate.
+		// It can only narrow, so a failure anywhere in it leaves the write.
+		if name, refined, ok := sparqlAccess(ctx, db, info.FullMethod, req); ok {
+			if err := key.AuthorizeOperation(name, refined); err != nil {
+				return nil, status.Error(codes.PermissionDenied, err.Error())
+			}
+		} else if err := key.AuthorizeCall(info.FullMethod, requestToolName(req)); err != nil {
+			return nil, status.Error(codes.PermissionDenied, err.Error())
+		}
+		// authorizeRequestRows is key.AuthorizeRows plus the one case it cannot
+		// answer: an RPC that names a row by id and carries no scope field. See
+		// ownership.go — those are waived here and enforced against the stored
+		// row by the handler, which is why the key travels on in the context.
+		if err := authorizeRequestRows(key, info.FullMethod, req); err != nil {
+			return nil, status.Error(codes.PermissionDenied, err.Error())
+		}
+		// The key also signs what this call writes (written_by) and confines
+		// the memory buckets it may resolve to; see authz.Key.CallerContext.
+		return handler(withCallerKey(key.CallerContext(ctx), key), req)
+	}
+}
+
+// bearerSecret pulls the token out of the authorization header.
+func bearerSecret(ctx context.Context) (string, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", status.Error(codes.Unauthenticated, "missing authorization metadata")
+	}
+	values := md.Get("authorization")
+	if len(values) == 0 {
+		return "", status.Error(codes.Unauthenticated, "missing authorization metadata")
+	}
+	secret, found := strings.CutPrefix(values[0], "Bearer ")
+	if !found {
+		return "", status.Error(codes.Unauthenticated, "invalid token")
+	}
+	return secret, nil
+}
+
+// requestToolName reads the tool name off a request, the same way the scope
+// check reads scope fields: through protoreflect, so no per-RPC wiring and no
+// dependency on the generated Go type.
+//
+// Anything it cannot read yields false, and authz.AuthorizeCall turns that into
+// a denial. That is the fail-closed direction — a CallTool whose name is
+// unreadable is a tool call nobody can classify, and letting it through would
+// mean the handler's own "unknown tool" is doing the security.
+func requestToolName(req any) authz.ToolNameLookup {
+	return func() (string, bool) {
+		msg, ok := req.(proto.Message)
+		if !ok || msg == nil {
+			return "", false
+		}
+		m := msg.ProtoReflect()
+		if !m.IsValid() {
+			return "", false
+		}
+		fd := m.Descriptor().Fields().ByName("name")
+		if fd == nil || fd.Kind() != protoreflect.StringKind || fd.IsList() || fd.IsMap() {
+			return "", false
+		}
+		return m.Get(fd).String(), true
+	}
+}
+
+// requestFieldLookup adapts a request message to authz.FieldLookup using
+// protoreflect, so the scope check needs no per-RPC code and no proto change:
+// the field names a scope confines are already on the wire.
+//
+// A request that is not a proto message yields nil, which authz.AuthorizeRows
+// treats as a denial for any confined key. That is the fail-closed case — an
+// authorisation decision that cannot see the request is not a decision.
+func requestFieldLookup(req any) authz.FieldLookup {
+	msg, ok := req.(proto.Message)
+	if !ok || msg == nil {
+		return nil
+	}
+	m := msg.ProtoReflect()
+	if !m.IsValid() {
+		return nil
+	}
+	return func(field string) (string, []string, bool) {
+		fd := m.Descriptor().Fields().ByName(protoreflect.Name(field))
+		declared := fd != nil && fd.Kind() == protoreflect.StringKind && !fd.IsList() && !fd.IsMap()
+		var top string
+		if declared {
+			top = m.Get(fd).String()
+		}
+		return top, collectNested(m, protoreflect.Name(field), nestedScanDepth), declared
+	}
+}
+
+// collectNested gathers non-empty values of a string field with the given name
+// from the populated sub-messages of m, skipping m's own top-level field.
+//
+// Nested copies are collected because a value carried inside, say, a
+// RetrievalPlan's filters may be the one a handler ends up using. Rather than
+// reason about which wins for each RPC, the policy rejects any nested value
+// that disagrees with the key's confinement, which is correct whichever way the
+// precedence goes.
+func collectNested(m protoreflect.Message, field protoreflect.Name, depth int) []string {
+	if depth <= 0 {
+		return nil
+	}
+	var out []string
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind {
+			return true
+		}
+		switch {
+		case fd.IsMap():
+			// Map values are caller-supplied metadata, not request structure;
+			// nothing in cortexdb.v1 carries a scope field inside one.
+			return true
+		case fd.IsList():
+			list := v.List()
+			for i := range list.Len() {
+				out = append(out, scopeValuesIn(list.Get(i).Message(), field, depth)...)
+			}
+		default:
+			out = append(out, scopeValuesIn(v.Message(), field, depth)...)
+		}
+		return true
+	})
+	return out
+}
+
+// scopeValuesIn reads the named field off one sub-message and keeps descending.
+func scopeValuesIn(m protoreflect.Message, field protoreflect.Name, depth int) []string {
+	if !m.IsValid() {
+		return nil
+	}
+	var out []string
+	if fd := m.Descriptor().Fields().ByName(field); fd != nil &&
+		fd.Kind() == protoreflect.StringKind && !fd.IsList() && !fd.IsMap() {
+		if s := m.Get(fd).String(); s != "" {
+			out = append(out, s)
+		}
+	}
+	return append(out, collectNested(m, field, depth-1)...)
+}

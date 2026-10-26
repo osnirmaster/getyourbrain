@@ -1,0 +1,143 @@
+// Package liveview serves a knowledge graph as a live, rotatable 3D page.
+//
+// A rendered file is true for the instant it was taken. This serves a page
+// instead — a WebGL scene on 127.0.0.1 that keeps up with the graph on its own,
+// so a graph being written can be watched rather than re-rendered.
+//
+// Two things move on the page, and they arrive by different routes:
+//
+//   - Structure — nodes and relations appearing or disappearing. Found by
+//     asking the store's change feed every couple of seconds whether any node
+//     or edge changed, and re-reading and diffing the graph only when one did
+//     (and once a minute regardless) — it can be written by any process
+//     sharing it. Only the difference is sent, so the layout keeps every node
+//     that did not change exactly where it had settled.
+//   - Activity — a query running, something being saved, a relation drawn.
+//     A query changes nothing in the graph, so no amount of polling can show
+//     one. These are reported by whoever handled the call, through
+//     [Server.Observe], and light up the nodes they named.
+//
+// What is drawn is coloured by node type, which answers "what is in here". The
+// other question a person brings to a picture of a brain is which of it anybody
+// checked, and the knowledge contract answers that per record — so [Node] and
+// [Edge] carry the record's `_grade` and the page has a switch between the two
+// palettes. Type is the default and stays it. Grade mode draws the contract's
+// five in the product's own colours, lifted for this background (see grade.go),
+// with [GradeLegend] as the legend — an unexplained colour scheme is decoration
+// — and it colours the relations as well as the things, because a graph's
+// assertions are mostly edges. A source whose reads do not carry grades sets
+// [Source.Grades] false and the legend says so, which is a different finding
+// from a store on which nothing is graded.
+//
+// Selecting a node or a relation opens the inspector, which is the fourth route
+// onto the page and the one that joins the picture to the product: the record's
+// source file and chunk, its producer, its grade and the reason for it, when the
+// fact became true, the text it was drawn from, what it was recorded as
+// contradicting, and the decision somebody signed against it — every id among
+// them a link, so a reader can walk from a fact to what disagrees with it
+// without going back to the search box. It arrives through [Source.Record] as a
+// [RecordDetail], fetched once per click rather than polled, which is what makes
+// it affordable to answer that expensively. Nil is a legitimate answer here too,
+// and there are three states rather than two: the source cannot be asked, the
+// source looked and the shelf no longer holds this, and here is the record.
+//
+// The page can also be pinned to an instant. [Source.ReadAsOf] reads the graph
+// as it stood then, through the same as-of machinery every other past read in
+// the module uses, and the page says so in a banner that cannot be folded
+// away — a graph quietly showing last week is worse than one that cannot show
+// it at all. Live updates stop while pinned, and stop on the server: a pinned
+// stream never subscribes to the poller, so there is no delta to arrive. Per
+// connection, not per server, because one reader looking at last Tuesday must
+// not freeze the page of the reader beside them.
+//
+// A third thing on the page does not move, and says so by arriving differently.
+// The contract panel answers how much of this store stands on what, and what on
+// it is waiting for a person — the knowledge contract, read back through
+// [Source.Contract] as a [ContractReport]. It is two aggregate scans and a
+// filtered read over a shelf that changes when somebody reviews a record, so
+// the panel fetches it from /api/contract on its own slow timer
+// ([ContractInterval]) rather than riding the structure poll. A source that
+// keeps no contract leaves the hook nil, and the panel says that in words: a
+// store nobody can ask and a store nobody has graded are different findings,
+// and the second is the one a real machine is usually in.
+//
+// Besides the ontology page described next, a page at /library draws the
+// instance graph again as a reading room rather than a field of points: a
+// memory is a book on the shelf of the project it names, shelves stand in wings
+// cut from the projects' own relations, an entity is an index card, and a book
+// opens on a lectern. It reads the same snapshot the graph page polls, so the
+// two never disagree about what is in the brain; library.go says what is
+// shelved where and why.
+//
+// There is a second page, at /ontology, and it draws a different graph about
+// the same store: not what is in this brain but what it is allowed to talk
+// about — tens of declared object types with link types between them, read
+// back through [Source.Ontology] as an [OntologyReport]. It is drawn as a
+// deterministic 2D diagram rather than in the scene next door, for the reason
+// spelled out over ontologyHTML: an ontology is tens of named nodes with
+// declared structure — interfaces, link direction, a foreign key on one side —
+// and a force layout can only express distance.
+//
+// A picture of the declarations alone describes intent. Held against what the
+// store's records are actually typed as, it describes reality, and the gap is
+// the finding: a declared type at zero instances is something nobody used, a
+// node_type nothing declares is the reverse, and on a real brain it is most of
+// them. Which of the four things this page has to say — the source cannot be
+// asked, nothing is saved, a schema is saved and unused, a schema is in use —
+// is [OntologyReport.State], decided in Go so the page never reads an empty
+// list and guesses.
+//
+// That page has a second half, because on a real brain the first half is a
+// dead end: nothing is declared, so the diagram is empty and the finding is
+// "nobody has modelled this store". [Source.Draft] answers the question that
+// leaves — what *could* be declared — by deriving a first schema from the
+// store's own vocabulary and drawing it through the same lanes, the same
+// curves and the same overlay, so the counts under the boxes are real and the
+// band outside the model is exactly what the deriver bucketed out or withheld.
+// It arrives as an [OntologyDraftView], which is an [OntologyReport] plus the
+// half a draft has and a saved schema does not: the questions a person has to
+// answer before signing it, and the threshold the drawing was pruned at.
+// Nothing on that path writes — [OntologyDrafted] is a proposal, saving is a
+// person's act done through ontology_save — and its three states
+// ([OntologyDrafted], [OntologyNothingToDraft], [OntologyUndraftable]) share
+// no word with the saved four, so a draft can never be handed a saved
+// schema's sentence.
+//
+// The page can also be asked, not only looked at — the subject of explore.go.
+// The scene is the store's most-connected core, a few percent of a real brain,
+// and the Explore bar reaches past it: find a node by name anywhere in the
+// store, ask the brain a question and light up what the answer names, run
+// read-only Cypher, and expand any node to its neighbours whether or not the
+// core drew them. Each runs one of the brain's own tools through
+// [Source.Call] — the toolbox for a local file, the ToolsService for a shared
+// brain — so a shared brain also gets the inspector it lacked. Only tools on
+// [ExploreTools] can be run that way, every one a read. Every starting point is
+// a URL parameter too (?focus, ?ask, ?cypher, ...), so a view is a link that
+// can be shared, and on a phone the inspector is a bottom sheet and the corner
+// panels start folded.
+//
+// A caller supplies a [Source], which is anything that can read nodes and
+// edges. [OpenSource] builds one from the ambient CortexDB configuration
+// (CORTEXDB_REMOTE for a shared brain, CORTEXDB_PATH otherwise), and
+// [LoadLocal] and [LoadRemote] are exported for callers that know which graph
+// they want and would rather say so than set environment variables.
+//
+// The listener binds 127.0.0.1 and there is deliberately no option to widen it.
+// The page is the whole graph with no authentication in front of it, so a
+// listener on any other interface would be an unauthenticated read of
+// everything it contains. An embedder that needs to expose it further should
+// put its own authenticated proxy in front rather than ask for a wider bind.
+//
+// Typical use:
+//
+//	src, err := liveview.OpenSource(ctx)
+//	if err != nil {
+//		return err
+//	}
+//	sv, err := liveview.Start(ctx, src, liveview.DefaultPort, liveview.DefaultInterval, false)
+//	if err != nil {
+//		return err
+//	}
+//	defer sv.Close()
+//	fmt.Println(sv.URL())
+package liveview

@@ -1,0 +1,307 @@
+diff --git a/cmd/cortexdb-mcp-stdio/assets/vis-network.LICENSE-MIT b/cmd/cortexdb-mcp-stdio/assets/vis-network.LICENSE-MIT
+new file mode 100644
+index 0000000..ca928f7
+--- /dev/null
++++ b/cmd/cortexdb-mcp-stdio/assets/vis-network.LICENSE-MIT
+@@ -0,0 +1,21 @@
++The MIT License (MIT)
++
++Copyright (c) 2014-2017 Almende B.V.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/cmd/cortexdb-mcp-stdio/graph.go b/cmd/cortexdb-mcp-stdio/graph.go
+index 7ce3316..b5ff94b 100644
+--- a/cmd/cortexdb-mcp-stdio/graph.go
++++ b/cmd/cortexdb-mcp-stdio/graph.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"context"
+ 	"database/sql"
++	_ "embed"
+ 	"encoding/json"
+ 	"fmt"
+ 	"html/template"
+@@ -161,14 +162,21 @@ func writeBrainGraphHTML(path string, nodes []graphNodeView, edges []graphEdgeVi
+ 	return brainGraphTemplate.Execute(f, map[string]template.JS{
+ 		"Nodes": template.JS(nodesJSON),
+ 		"Edges": template.JS(edgesJSON),
++		"Vis":   template.JS(visNetworkJS),
+ 	})
+ }
+ 
++// visNetworkJS is vis-network@9.1.9 (MIT/Apache-2.0), inlined into the page.
++// GetYourBrain: build autocontido, the page used to load it from unpkg.
++//
++//go:embed assets/vis-network.min.js
++var visNetworkJS string
++
+ // brainGraphTemplate renders an interactive force-directed graph with
+-// vis-network (loaded from a CDN). Self-contained otherwise.
++// vis-network, inlined, so the file works with no network at all.
+ var brainGraphTemplate = template.Must(template.New("graph").Parse(`<!DOCTYPE html>
+ <html lang="en"><head><meta charset="utf-8"><title>CortexDB knowledge graph</title>
+-<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
++<script>{{.Vis}}</script>
+ <style>
+   html,body{margin:0;height:100%;background:#ffffff;color:#0f172a;font:14px system-ui,-apple-system,sans-serif}
+   #net{width:100%;height:100vh}
+diff --git a/cmd/cortexdb-mcp-stdio/localonly.go b/cmd/cortexdb-mcp-stdio/localonly.go
+new file mode 100644
+index 0000000..fb665e6
+--- /dev/null
++++ b/cmd/cortexdb-mcp-stdio/localonly.go
+@@ -0,0 +1,7 @@
++package main
++
++import "github.com/liliang-cn/cortexdb/v2/pkg/localonly"
++
++// GetYourBrain: build autocontido. Runs before main, so no client can be
++// built on the stock transport.
++func init() { localonly.Install() }
+diff --git a/pkg/cortexdb/cortexdb.go b/pkg/cortexdb/cortexdb.go
+index b36117f..6fbdf1e 100644
+--- a/pkg/cortexdb/cortexdb.go
++++ b/pkg/cortexdb/cortexdb.go
+@@ -232,6 +232,10 @@ func Open(config Config, opts ...Option) (*DB, error) {
+ 	// always been, a postgres:// URL is PostgreSQL + pgvector.
+ 	dsn := config.Path
+ 	kind := sqldialect.KindForDSN(dsn)
++	// GetYourBrain: build autocontido, só o arquivo SQLite local.
++	if kind != sqldialect.KindForDSN("cortexdb.db") {
++		return nil, fmt.Errorf("CORTEXDB_PATH precisa ser um arquivo SQLite local (GetYourBrain autocontido)")
++	}
+ 	store, err := core.OpenBrainStore(dsn, coreConfig)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create store: %w", err)
+diff --git a/pkg/liveview/assets.go b/pkg/liveview/assets.go
+index c83be93..28f5344 100644
+--- a/pkg/liveview/assets.go
++++ b/pkg/liveview/assets.go
+@@ -3,9 +3,10 @@ package liveview
+ import (
+ 	"compress/gzip"
+ 	"crypto/sha256"
+-	_ "embed"
++	"embed"
+ 	"encoding/hex"
+ 	"io"
++	"io/fs"
+ 	"net/http"
+ 	"strings"
+ 	"sync"
+@@ -133,3 +134,18 @@ func (g *gzipResponseWriter) close() {
+ 		g.zw = nil
+ 	}
+ }
++
++// GetYourBrain: build autocontido. The library page imported three and its
++// addons from unpkg; they are served from the binary instead (three@0.168.0,
++// MIT, see assets/three/LICENSE).
++//
++//go:embed assets/three
++var threeAssets embed.FS
++
++func threeHandler() http.Handler {
++	sub, err := fs.Sub(threeAssets, "assets/three")
++	if err != nil {
++		panic(err)
++	}
++	return http.StripPrefix("/assets/three/", http.FileServer(http.FS(sub)))
++}
+diff --git a/pkg/liveview/assets/three/LICENSE b/pkg/liveview/assets/three/LICENSE
+new file mode 100644
+index 0000000..d33709f
+--- /dev/null
++++ b/pkg/liveview/assets/three/LICENSE
+@@ -0,0 +1,21 @@
++The MIT License
++
++Copyright © 2010-2024 three.js authors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
+diff --git a/pkg/liveview/library_page.go b/pkg/liveview/library_page.go
+index f743118..278b99a 100644
+--- a/pkg/liveview/library_page.go
++++ b/pkg/liveview/library_page.go
+@@ -114,8 +114,8 @@ const libraryHTML = `<!DOCTYPE html>
+   }
+ </style>
+ <script type="importmap">{"imports":{
+-  "three":"https://unpkg.com/three@0.168.0/build/three.module.js",
+-  "three/addons/":"https://unpkg.com/three@0.168.0/examples/jsm/"
++  "three":"assets/three/three.module.min.js",
++  "three/addons/":"assets/three/addons/"
+ }}</script>
+ </head>
+ <body>
+diff --git a/pkg/liveview/server.go b/pkg/liveview/server.go
+index 2583827..6b9a4e5 100644
+--- a/pkg/liveview/server.go
++++ b/pkg/liveview/server.go
+@@ -265,6 +265,7 @@ func New(ctx context.Context, src *Source, interval time.Duration, activity bool
+ 	mux.HandleFunc("/api/ask", s.handleAsk)
+ 	mux.HandleFunc("/api/cypher", s.handleCypher)
+ 	mux.HandleFunc("/"+graph3dPath, handleGraph3D)
++	mux.Handle("/assets/three/", threeHandler())
+ 	s.mux = mux
+ 
+ 	go s.poll(ctx)
+diff --git a/pkg/localonly/localonly.go b/pkg/localonly/localonly.go
+new file mode 100644
+index 0000000..e02f50f
+--- /dev/null
++++ b/pkg/localonly/localonly.go
+@@ -0,0 +1,51 @@
++// Package localonly is the GetYourBrain egress guard: every outbound
++// connection this binary opens must go to the loopback interface.
++//
++// GetYourBrain builds CortexDB as a self-contained component. The upstream
++// code can talk to external embedders, LLMs, rerankers (OPENAI_API_KEY and
++// friends are read from the environment), remote brains over gRPC and SPARQL
++// SERVICE endpoints. Instead of patching each client, Install swaps the
++// transport they all share, and Dial is the only dialer gRPC gets.
++package localonly
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"net/http"
++	"time"
++)
++
++// Allowed reports whether addr ("host:port") names the loopback interface.
++// Hostnames other than "localhost" are refused before any DNS lookup, so not
++// even the name leaves the machine.
++func Allowed(addr string) bool {
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil {
++		host = addr
++	}
++	if host == "localhost" {
++		return true
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && ip.IsLoopback()
++}
++
++// Dial is a net.Dialer.DialContext that refuses anything but loopback.
++func Dial(ctx context.Context, network, addr string) (net.Conn, error) {
++	if !Allowed(addr) {
++		return nil, fmt.Errorf("conexão com %s bloqueada: GetYourBrain só permite loopback", addr)
++	}
++	d := net.Dialer{Timeout: 30 * time.Second}
++	return d.DialContext(ctx, network, addr)
++}
++
++// Install points http.DefaultTransport (and so http.DefaultClient and every
++// http.Client without its own Transport) at Dial, with proxies disabled.
++func Install() {
++	t := http.DefaultTransport.(*http.Transport).Clone()
++	t.Proxy = nil
++	t.DialContext = Dial
++	t.DialTLSContext = nil
++	http.DefaultTransport = t
++}
+diff --git a/pkg/localonly/localonly_test.go b/pkg/localonly/localonly_test.go
+new file mode 100644
+index 0000000..28e134b
+--- /dev/null
++++ b/pkg/localonly/localonly_test.go
+@@ -0,0 +1,36 @@
++package localonly
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestAllowed(t *testing.T) {
++	for addr, want := range map[string]bool{
++		"127.0.0.1:9200":     true,
++		"[::1]:9200":         true,
++		"localhost:11434":    true,
++		"api.openai.com:443": false,
++		"10.0.0.5:80":        false,
++		"0.0.0.0:80":         false,
++	} {
++		if got := Allowed(addr); got != want {
++			t.Errorf("Allowed(%q) = %v, want %v", addr, got, want)
++		}
++	}
++}
++
++func TestInstallBlocksExternalAndKeepsLoopback(t *testing.T) {
++	Install()
++	if _, err := http.Get("https://api.openai.com/v1/models"); err == nil {
++		t.Fatal("external request was not blocked")
++	}
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
++	defer srv.Close()
++	resp, err := http.Get(srv.URL)
++	if err != nil {
++		t.Fatalf("loopback request failed: %v", err)
++	}
++	resp.Body.Close()
++}
+diff --git a/pkg/rpc/conn.go b/pkg/rpc/conn.go
+index 551d27d..7a89b50 100644
+--- a/pkg/rpc/conn.go
++++ b/pkg/rpc/conn.go
+@@ -1,8 +1,12 @@
+ package rpc
+ 
+ import (
++	"context"
++	"net"
+ 	"time"
+ 
++	"github.com/liliang-cn/cortexdb/v2/pkg/localonly"
++
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/keepalive"
+ )
+@@ -49,6 +53,10 @@ const retryServiceConfig = `{
+ // connection to a brain open between calls.
+ func DialOptions() []grpc.DialOption {
+ 	return []grpc.DialOption{
++		// GetYourBrain: build autocontido, gRPC só para loopback.
++		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
++			return localonly.Dial(ctx, "tcp", addr)
++		}),
+ 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+ 			Time:                clientPingInterval,
+ 			Timeout:             clientPingTimeout,

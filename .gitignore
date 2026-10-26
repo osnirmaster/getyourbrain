@@ -1,5 +1,5 @@
-.env
+bin/
 dados/
 saida/
-.venv/
-__pycache__/
+vendor/xerj/engine/target/
+.crossnote/

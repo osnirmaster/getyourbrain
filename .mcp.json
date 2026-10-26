@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "xerj": {
+      "command": "scripts/mcp_xerj.sh"
+    },
+    "cortexdb": {
+      "command": "scripts/mcp_cortexdb.sh"
+    }
+  }
+}

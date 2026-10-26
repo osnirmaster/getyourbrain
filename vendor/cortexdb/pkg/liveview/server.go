@@ -1,0 +1,932 @@
+package liveview
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	cortexdb "github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
+)
+
+// The live view's server.
+//
+// It binds 127.0.0.1 and nothing else. The page it serves is the brain's
+// contents — every entity anyone stored — and this process holds a working
+// connection to that brain, so a listener on any other interface would be an
+// unauthenticated read of the whole thing to whoever is on the network. There
+// is deliberately no flag to widen it.
+
+// DefaultPort is the preferred port, chosen high and unusual so it does not
+// collide with whatever else is being developed on this machine. When it is
+// taken the server asks the OS for a free one instead of failing: a view is not
+// worth an error, and the caller is told the URL either way.
+const DefaultPort = 37423
+
+// DefaultInterval is how often the brain is re-read for structural change.
+// Activity does not wait for it — that arrives the moment a tool call is
+// handled — so this only bounds how late a write from *another* machine shows
+// up, and polling a database faster than a person can read the result is spend
+// with nothing bought.
+const DefaultInterval = 2 * time.Second
+
+// Source is where a live server reads the graph from.
+type Source struct {
+	Describe string
+	Read     func(ctx context.Context) ([]Node, []Edge, error)
+	// Grades reports whether Read fills in Node.Grade and Edge.Grade.
+	//
+	// A field rather than a hook, which is the odd one out here and
+	// deliberate: every other optional answer on this struct is a separate
+	// question the source is asked, and a grade is not — it rides on Read, on
+	// the record the page is already drawing. So what has to be declared is
+	// not "can you answer this" but "does what you already answer carry it",
+	// which is a fact about the source rather than a call.
+	//
+	// It exists for the same reason the nil hooks do. A source that cannot
+	// report grades returns every node ungraded, which is indistinguishable on
+	// the wire from a shelf nobody has stamped — and those are different
+	// findings. The shared brain is exactly this case: graph_list_all carries
+	// no grade, so the colour-by-grade mode says it cannot be read here rather
+	// than painting the whole brain the untagged grey.
+	Grades bool
+	// Changes asks the store's change feed whether any node or edge changed
+	// after cursor, and returns the cursor for the next look; a negative
+	// cursor asks for the current head. The poller re-reads the graph only
+	// when it says something changed.
+	//
+	// Optional: nil, or an error (a brain older than the feed), means the
+	// poller re-reads on every tick, as it did before the feed existed.
+	Changes func(ctx context.Context, after int64) (cursor int64, changed bool, err error)
+	// ReadAsOf reads the graph as it stood at an instant, for the page pinned
+	// to a moment in the past.
+	//
+	// Optional, and nil is a legitimate answer: a side graph assembled in
+	// memory has no history, and a shared brain has one this view cannot reach
+	// — graph_list_all answers about now and nothing else. A nil hook must
+	// never render as "the graph was empty then". The page says the source
+	// cannot be asked about the past, and stays where it is.
+	//
+	// A hook of its own rather than an argument to Read, for the reason
+	// graph.ReadOptions gives about the as-of epoch: it is not a parameter to
+	// one query but the instant a whole read happens in, and a source that can
+	// answer about now and not about then must be able to say so.
+	ReadAsOf func(ctx context.Context, at time.Time) ([]Node, []Edge, error)
+	// Record answers everything the store can say about one node or edge: its
+	// source file and chunk, its producer, its grade and why, when it became
+	// true, the text it was drawn from, what it was recorded as contradicting,
+	// and what anybody decided about it.
+	//
+	// Optional and nil for the same reason Contract is, with the same
+	// consequence: nil must render as "this view cannot look a record up", not
+	// as a record that carries nothing. The two are different findings and the
+	// panel says which — and a third state sits beside them, a record the
+	// source looked for and did not find, which on a graph being written under
+	// the view is a real event rather than a fault.
+	Record func(ctx context.Context, id string) (RecordDetail, error)
+	// Contract answers the knowledge contract's two questions about this
+	// store: how much of it stands on what, and what on it needs a person.
+	//
+	// Optional, and nil is a legitimate answer rather than an oversight: a
+	// source can be a graph that keeps no contract metadata at all — a side
+	// graph assembled in memory, say. The panel says so in words instead of
+	// drawing an empty chart over it, so nil never reads as "nothing here is
+	// graded", which is a different and much more common finding.
+	Contract func(ctx context.Context) (ContractReport, error)
+	// Ontology answers what this store is allowed to talk about — the object
+	// types and link types it declares — and, when asked for, what its records
+	// are actually typed as, so the two can be held against each other.
+	//
+	// Optional and nil for the same reason Contract is, and with a sharper
+	// consequence: a nil hook must never render as "no ontology is saved". A
+	// store nobody can ask and a store nobody has modelled are different
+	// findings, and the second is far and away the more common one — so
+	// [OntologyReport.State] names which, and the page reads that rather than
+	// inferring it from an empty list of types.
+	Ontology func(ctx context.Context, q OntologyQuery) (OntologyReport, error)
+	// Draft derives an ontology this store does not have — what *could* be
+	// declared, held against what is there, with the questions a person has
+	// to answer beside it. It saves nothing.
+	//
+	// A hook of its own rather than a flag on OntologyQuery, because nil is
+	// the answer to a different question. Ontology non-nil means "this source
+	// can be asked what it declares"; the shared brain answers that today and
+	// cannot derive a draft, because ontology_draft postdates the version it
+	// runs. One nil check cannot carry two answers, and folding the two would
+	// leave a source that can read a schema but not derive one with no way to
+	// say so — which is the state the cluster is actually in.
+	Draft func(ctx context.Context, q OntologyDraftQuery) (OntologyDraftView, error)
+	// Call runs one of the brain's read-only tools for the page — find,
+	// expand, ask, Cypher; see explore.go. Nil hides those controls. The
+	// callers this package builds refuse every tool not on [ExploreTools].
+	Call  Caller
+	Close func() error
+}
+
+// OpenSource opens whichever brain this process is configured for. The
+// local database is opened once and held: the poller reads it every couple of
+// seconds, and reopening the file on that cadence would be pointless churn.
+func OpenSource(ctx context.Context) (*Source, error) {
+	if addr, token, ok := RemoteConfigured(); ok {
+		return RemoteSource(addr, token), nil
+	}
+
+	dbPath := os.Getenv("CORTEXDB_PATH")
+	if dbPath == "" {
+		dbPath = cortexdb.DefaultDBPath()
+	}
+	// Opened plainly, with no embedder and no reranker. The view reads the
+	// graph tables directly and never embeds anything, so wiring up a model it
+	// will not call would only add a way for a read-only picture to fail.
+	db, err := cortexdb.Open(cortexdb.DefaultConfig(dbPath))
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", dbPath, err)
+	}
+	return &Source{
+		Describe: dbPath,
+		Read: func(ctx context.Context) ([]Node, []Edge, error) {
+			return LoadLocal(ctx, db.SQL())
+		},
+		Grades:   true,
+		Changes:  localChanges(db),
+		ReadAsOf: localReadAsOf(db),
+		Record:   localRecord(db),
+		Contract: localContract(db),
+		Ontology: localOntology(db),
+		Draft:    localDraft(db),
+		Call:     localCaller(db),
+		Close:    db.Close,
+	}, nil
+}
+
+// Server serves one live view.
+type Server struct {
+	hub      *Hub
+	src      *Source
+	url      string
+	interval time.Duration
+
+	ln   net.Listener
+	http *http.Server
+	// mux is the routes, kept so a view built by New can hand them to a mux it
+	// does not own. Start wraps the same mux in its own http.Server.
+	mux *http.ServeMux
+	// activity reports whether tool calls are being observed. A view started
+	// from the command line polls a database and sees structure only; one
+	// started from inside the MCP server sees the calls too. The page says
+	// which, because a still ticker otherwise reads as a broken feature.
+	activity bool
+	// cursor is where the change feed was last read; -1 when the source has
+	// no feed or it has not answered yet.
+	cursor int64
+}
+
+// fullReadEvery bounds how stale the view can be when the feed says nothing
+// changed. A write the feed did not log — a store with its feed turned off —
+// still shows up within a minute, and on the shared brain one full read a
+// minute is a thirtieth of what polling every two seconds cost.
+const fullReadEvery = time.Minute
+
+// New reads the graph once, starts polling, and returns a view that serves
+// on a mux somebody else owns — see Handler.
+//
+// It exists because Start binds its own loopback listener, which is right for
+// the MCP server (the view is a thing you open, and a port is how you open it)
+// and wrong for a process that already has an HTTP server and wants the graph
+// as one page of it. That process should not have to run a second listener
+// on a second port for one route. Everything Start did apart from listening is
+// here, and Start is now New plus a listener.
+//
+// The pages fetch their APIs by relative path ("api/graph", href="ontology"),
+// so the handler can be mounted under a prefix — with http.StripPrefix and a
+// trailing slash on the mount — and the browser resolves the rest.
+func New(ctx context.Context, src *Source, interval time.Duration, activity bool) (*Server, error) {
+	if src == nil {
+		return nil, fmt.Errorf("live view: a source is required")
+	}
+	if interval <= 0 {
+		interval = DefaultInterval
+	}
+	s := &Server{
+		hub:      NewHub(),
+		src:      src,
+		interval: interval,
+		activity: activity,
+	}
+
+	// The feed's head is taken before the first read, so a change landing
+	// between the two is seen as a change rather than missed.
+	s.cursor = -1
+	if src.Changes != nil {
+		if c, _, err := src.Changes(ctx, -1); err == nil {
+			s.cursor = c
+		}
+	}
+	// One read before serving, so the first page load draws a graph instead of
+	// an empty scene that fills in a poll later.
+	if nodes, edges, rerr := src.Read(ctx); rerr == nil {
+		s.hub.publishSnapshot(Snapshot{Nodes: nodes, Edges: edges})
+	} else {
+		fmt.Fprintf(os.Stderr, "cortexdb: live view: first read failed: %v\n", rerr)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handlePage)
+	// The ontology is a second page rather than a mode of the first. It draws
+	// a different graph — tens of declared types, not thousands of instances —
+	// with a different layout, a different cadence and different honesty
+	// states, and a switch on one page would have had to carry all of that
+	// while pretending the two were views of one thing.
+	mux.HandleFunc("/ontology", s.handleOntologyPage)
+	// The library is the same brain as the graph page, laid out as a reading
+	// room: a memory is a book on its project's shelf. A page of its own for
+	// the reason the ontology is one — a different layout with its own
+	// interactions — but drawn from the same snapshot, so the two never
+	// disagree about what is in the brain.
+	mux.HandleFunc("/library", s.handleLibraryPage)
+	mux.HandleFunc("/api/library", s.handleLibrary)
+	mux.HandleFunc("/api/library/card", s.handleLibraryCard)
+	mux.HandleFunc("/api/library/book", s.handleLibraryBook)
+	mux.HandleFunc("/api/graph", s.handleGraph)
+	mux.HandleFunc("/api/record", s.handleRecord)
+	mux.HandleFunc("/api/contract", s.handleContract)
+	mux.HandleFunc("/api/ontology", s.handleOntology)
+	mux.HandleFunc("/api/stream", s.handleStream)
+	mux.HandleFunc("/api/find", s.handleFind)
+	mux.HandleFunc("/api/expand", s.handleExpand)
+	mux.HandleFunc("/api/ask", s.handleAsk)
+	mux.HandleFunc("/api/cypher", s.handleCypher)
+	mux.HandleFunc("/"+graph3dPath, handleGraph3D)
+	mux.Handle("/assets/three/", threeHandler())
+	s.mux = mux
+
+	go s.poll(ctx)
+	return s, nil
+}
+
+// Handler is the view's routes, rooted at "/". Mount it wherever the page
+// should live; the pages' own links and fetches are relative, so a prefix
+// works as long as it ends in a slash and is stripped before this handler.
+func (s *Server) Handler() http.Handler { return withGzip(s.mux) }
+
+// Start reads the graph once, starts serving on its own loopback listener,
+// and starts polling. It returns as soon as the URL is usable.
+func Start(ctx context.Context, src *Source, port int, interval time.Duration, activity bool) (*Server, error) {
+	s, err := New(ctx, src, interval, activity)
+	if err != nil {
+		return nil, err
+	}
+	ln, err := listenLocal(port)
+	if err != nil {
+		return nil, err
+	}
+	s.ln = ln
+	s.url = "http://" + ln.Addr().String()
+	s.http = &http.Server{Handler: withGzip(s.mux), ReadHeaderTimeout: 10 * time.Second}
+
+	go func() {
+		if serr := s.http.Serve(ln); serr != nil && serr != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "cortexdb: live view: %v\n", serr)
+		}
+	}()
+	return s, nil
+}
+
+// listenLocal binds the preferred port, falling back to any free one.
+func listenLocal(port int) (net.Listener, error) {
+	if port < 0 {
+		port = DefaultPort
+	}
+	if port > 0 {
+		if ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port)); err == nil {
+			return ln, nil
+		}
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen on 127.0.0.1: %w", err)
+	}
+	return ln, nil
+}
+
+// URL is where the view is.
+func (s *Server) URL() string { return s.url }
+
+// Snapshot is the graph as last read.
+func (s *Server) Snapshot() Snapshot { return s.hub.snapshot() }
+
+// SourceName names the brain this view reads, for a caller that wants to say so.
+func (s *Server) SourceName() string { return s.src.Describe }
+
+// WatchesCalls reports whether tool calls reach this view. A view polling a
+// database sees structure only; one fed by an MCP server sees the queries too,
+// and the page says which rather than leaving a still ticker to be read as a
+// fault.
+func (s *Server) WatchesCalls() bool { return s.activity }
+
+// Close stops serving and releases the brain.
+func (s *Server) Close() error {
+	// Shutdown stops the listener at once and then waits for handlers to
+	// finish. Every open page is holding an SSE stream that only ends when its
+	// request context does, so that wait always runs to the deadline — two
+	// seconds of nothing, on every settings change, with the caller's lock
+	// held. Close the connections instead: the listener is already shut, and a
+	// stream to a view that is going away has nothing left to say.
+	// A view built by New has no server of its own to stop: the process that
+	// mounted it owns the listener, and shutting that down is its business.
+	if s.http != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		if err := s.http.Shutdown(shutCtx); err != nil {
+			// Deadline reached with streams still attached, which is the normal
+			// case rather than a fault. Close forces them down.
+			_ = s.http.Close()
+		}
+	}
+	if s.src.Close != nil {
+		return s.src.Close()
+	}
+	return nil
+}
+
+// poll re-reads the brain on a timer and publishes what changed.
+//
+// A failed read is reported once and then retried silently: the brain being
+// briefly unavailable — a shared one restarting, a database locked by a writer
+// — is a normal thing to live through, and a page that logs a line per second
+// about it is worse than one that waits.
+func (s *Server) poll(ctx context.Context) {
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+	failing, feedFailing := false, false
+	cursor, lastRead := s.cursor, time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if s.src.Changes != nil {
+			if cursor < 0 {
+				if c, _, err := s.src.Changes(ctx, -1); err == nil {
+					cursor = c
+				}
+			}
+			if cursor >= 0 {
+				next, changed, err := s.src.Changes(ctx, cursor)
+				switch {
+				case err == nil:
+					feedFailing = false
+					cursor = next
+					if !changed && time.Since(lastRead) < fullReadEvery {
+						continue
+					}
+				case !feedFailing:
+					fmt.Fprintf(os.Stderr, "cortexdb: live view: change feed: %v; re-reading on every tick\n", err)
+					feedFailing = true
+				}
+			}
+		}
+		lastRead = time.Now()
+		nodes, edges, err := s.src.Read(ctx)
+		if err != nil {
+			if !failing {
+				fmt.Fprintf(os.Stderr, "cortexdb: live view: read graph: %v\n", err)
+				failing = true
+			}
+			continue
+		}
+		failing = false
+		s.hub.publishSnapshot(Snapshot{Nodes: nodes, Edges: edges})
+	}
+}
+
+// observe is the hook the MCP middleware calls for every handled tool call.
+func (s *Server) Observe(ev Event) { s.hub.publishEvent(ev) }
+
+func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The page is regenerated on every load rather than cached, so a rebuilt
+	// binary is never shadowed by a stale copy in the browser.
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(pageHTML))
+}
+
+// Payload is the page's opening state: everything needed to draw,
+// plus what the header reports about where it came from.
+type Payload struct {
+	Version  int64   `json:"version"`
+	Nodes    []Node  `json:"nodes"`
+	Edges    []Edge  `json:"edges"`
+	Events   []Event `json:"events"`
+	Source   string  `json:"source"`
+	Activity bool    `json:"activity"`
+	Interval int64   `json:"interval_ms"`
+
+	// Grades says the nodes and edges above carry a _grade, so the page may
+	// offer to colour by it. False is not "nothing is graded" — it is "this
+	// source does not report grades", and the legend says so rather than
+	// painting a brain the untagged grey.
+	Grades bool `json:"grades,omitempty"`
+	// Records says a record can be looked up on this source, so the inspector
+	// may offer to. False leaves the panel saying which of the two it is.
+	Records bool `json:"records,omitempty"`
+	// Temporal says this source can be asked about the past.
+	Temporal bool `json:"temporal,omitempty"`
+	// Explore says the page may find, expand, ask and run Cypher through
+	// this source (see explore.go).
+	Explore bool `json:"explore,omitempty"`
+
+	// AsOf is the instant this payload describes, unix milliseconds, and zero
+	// for the live graph. Pinned is not derivable from it — a page can ask for
+	// an instant a source cannot answer — so the two are separate, and the
+	// banner reads Pinned.
+	AsOf   int64 `json:"as_of,omitempty"`
+	Pinned bool  `json:"pinned,omitempty"`
+	// PinReason is why a pin was refused, when one was. Empty on both a live
+	// payload and a successful pin.
+	PinReason string `json:"pin_reason,omitempty"`
+}
+
+func (s *Server) payload() Payload {
+	snap := s.hub.snapshot()
+	backlog := s.hub.recentEvents()
+	return Payload{
+		Version:  snap.Version,
+		Nodes:    snap.Nodes,
+		Edges:    snap.Edges,
+		Events:   backlog,
+		Source:   s.src.Describe,
+		Activity: s.activity,
+		Interval: s.interval.Milliseconds(),
+		Grades:   s.src.Grades,
+		Records:  s.src.Record != nil,
+		Temporal: s.src.ReadAsOf != nil,
+		Explore:  s.src.Call != nil,
+	}
+}
+
+// pinnedPayload reads the graph as it stood at an instant and shapes it the way
+// the page expects an opening frame.
+//
+// A payload rather than an error whichever way it goes, for the reason the
+// contract endpoint gives: a failed fetch leaves the page showing what it drew
+// last, which after a pin is the present presented as the past. So a source
+// that cannot answer, a parameter that will not parse and a read that failed
+// all come back as a payload saying so, and the page keeps drawing the live
+// graph with the pin refused in words.
+//
+// The live snapshot is what it falls back to. That is not a silent substitution
+// — Pinned is false and PinReason says why — and it is the only fallback that
+// leaves a reader looking at something true.
+func (s *Server) pinnedPayload(ctx context.Context, raw string) Payload {
+	base := s.payload()
+	at, err := ParseAsOf(raw)
+	switch {
+	case err != nil:
+		base.PinReason = err.Error()
+		return base
+	case at.IsZero():
+		return base
+	case s.src.ReadAsOf == nil:
+		base.PinReason = "this view's source cannot be asked about the past"
+		base.AsOf = at.UnixMilli()
+		return base
+	}
+
+	nodes, edges, rerr := s.src.ReadAsOf(ctx, at)
+	if rerr != nil {
+		base.PinReason = rerr.Error()
+		base.AsOf = at.UnixMilli()
+		return base
+	}
+	base.Nodes, base.Edges = nodes, edges
+	base.AsOf = at.UnixMilli()
+	base.Pinned = true
+	// The activity ticker reports calls as they are handled, which is a fact
+	// about now however far back the scene is pinned. Saying the view is live
+	// while it is showing last Tuesday is exactly the confusion the banner
+	// exists to prevent, so a pinned frame claims nothing about liveness.
+	base.Activity = false
+	base.Events = nil
+	return base
+}
+
+func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if raw := r.URL.Query().Get("as_of"); strings.TrimSpace(raw) != "" {
+		_ = json.NewEncoder(w).Encode(s.pinnedPayload(r.Context(), raw))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(s.payload())
+}
+
+// handleRecord answers the inspector: everything the store can say about one
+// node or edge.
+//
+// Fetched on a click rather than polled or pushed, which is what makes it
+// affordable to answer expensively — a node read, an edge read, the supporting
+// chunks and a ledger query, once per record a person asks about.
+//
+// Like every other panel on this page, a source that cannot answer still gets
+// a 200 with a report saying why. A failed fetch would leave the panel showing
+// the record it drew last, which after a click on a different node is one
+// record's provenance under another record's name.
+func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	var detail RecordDetail
+	switch {
+	case s.src.Record == nil:
+		detail = unavailableRecord("this view's source cannot look a record up")
+	case id == "":
+		detail = unavailableRecord("no record id given")
+	default:
+		got, err := s.src.Record(r.Context(), id)
+		if err != nil {
+			detail = unavailableRecord(err.Error())
+		} else {
+			detail = got
+		}
+		detail.ID = id
+	}
+	_ = json.NewEncoder(w).Encode(detail)
+}
+
+// handleContract answers the contract panel.
+//
+// Read on demand rather than served from the hub: unlike structure it is not
+// diffed and never pushed, so there is nothing to hold between requests, and
+// the panel asks about once every fifteen seconds. It adds no listener and no
+// reach — it is the same store this process is already holding open, and the
+// page showing it is the same page already showing every node in it.
+//
+// A store this view cannot ask always returns 200 with a report that says why.
+// A failed fetch would leave the panel showing what it drew last, which after
+// an error is the previous answer presented as the current one.
+func (s *Server) handleContract(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	rep := ContractReport{}
+	switch {
+	case s.src.Contract == nil:
+		rep = unavailableContract("this view's source keeps no knowledge contract")
+	default:
+		got, err := s.src.Contract(r.Context())
+		if err != nil {
+			rep = unavailableContract(err.Error())
+		} else {
+			rep = got
+		}
+	}
+	_ = json.NewEncoder(w).Encode(rep)
+}
+
+// handleOntologyPage serves the second page: what this brain is allowed to
+// talk about, rather than what is in it.
+func (s *Server) handleOntologyPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(ontologyHTML))
+}
+
+// handleOntology answers the ontology page.
+//
+// One endpoint for both halves — the declarations and the store's own
+// vocabulary — because they are one finding. Split across two fetches they
+// would arrive at two different times against a store that can be written
+// between them, and the page would be left reconciling a schema read at one
+// instant with counts read at another, which is precisely the sort of quiet
+// disagreement this page exists to surface rather than create.
+//
+// gap=0 is the one thing that changes the work: the declarations alone, with
+// nothing read for the overlay. Same bargain the contract panel makes when it
+// is folded — the expensive read is the one nobody is looking at.
+//
+// Like the contract endpoint, a store this view cannot ask still answers 200
+// with a report saying why. A failed fetch would leave the page showing what
+// it drew last, which after an error is the previous answer presented as the
+// current one.
+func (s *Server) handleOntology(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if r.URL.Query().Get("draft") == "1" {
+		s.writeOntologyDraft(w, r)
+		return
+	}
+
+	q := OntologyQuery{
+		SchemaID: r.URL.Query().Get("schema"),
+		Usage:    r.URL.Query().Get("gap") != "0",
+	}
+	var rep OntologyReport
+	switch {
+	case s.src.Ontology == nil:
+		rep = unavailableOntology("this view's source cannot be asked for an ontology")
+	default:
+		got, err := s.src.Ontology(r.Context(), q)
+		if err != nil {
+			rep = unavailableOntology(err.Error())
+		} else {
+			rep = got
+		}
+	}
+	_ = json.NewEncoder(w).Encode(rep)
+}
+
+// writeOntologyDraft answers ?draft=1: not what this store declares, but what
+// it could declare, derived from what it holds.
+//
+// The same endpoint rather than one of its own, because it is the same
+// question asked with a different verb, and because the page then has one
+// loader, one instant and one place a report arrives — the argument
+// handleOntology already makes for not splitting the declarations from the
+// counts. ?draft=1 rather than a schema=draft sentinel: "draft" is a legal
+// schema id, and the deriver's own default one, so a sentinel would mean a
+// store that had saved its draft could never be shown its saved draft again.
+//
+// The threshold defaults to OntologyDraftDefaultMin rather than to the
+// deriver's zero. Zero is right for a program and wrong for a page: the shared
+// brain's unthresholded draft is 124 object types and 233 link types, and a
+// first load nobody can review teaches a reader that this page is not for
+// reviewing.
+//
+// Like the two endpoints above, a source that cannot answer still gets a 200
+// with a view saying why. A failed fetch would leave the page showing the
+// draft it drew last, which after an error is a different store's proposal
+// presented as this one's.
+func (s *Server) writeOntologyDraft(w http.ResponseWriter, r *http.Request) {
+	min := ontologyDraftMin(r.URL.Query().Get("min"), OntologyDraftDefaultMin)
+	q := OntologyDraftQuery{
+		SchemaID: r.URL.Query().Get("schema"),
+		MinNodes: ontologyDraftMin(r.URL.Query().Get("min_nodes"), min),
+		MinEdges: ontologyDraftMin(r.URL.Query().Get("min_edges"), min),
+	}
+
+	var view OntologyDraftView
+	switch {
+	case s.src.Draft == nil:
+		view = unavailableDraft("this view's source cannot be asked to draft an ontology")
+	default:
+		got, err := s.src.Draft(r.Context(), q)
+		if err != nil {
+			view = unavailableDraft(err.Error())
+		} else {
+			view = got
+		}
+	}
+	_ = json.NewEncoder(w).Encode(view)
+}
+
+// ontologyDraftMin reads one threshold, falling back rather than failing.
+//
+// Zero has to be expressible — it is how a reader asks for the whole
+// vocabulary — so "absent" and "0" cannot be the same thing, which is why this
+// takes the raw string. A value that is not a number falls back to the
+// default: a page is not worth a 400, and drafting 124 types because somebody
+// typed a word is the wrong way to be strict.
+func ontologyDraftMin(raw string, fallback int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
+// handleStream is the live channel: one SSE connection per open page.
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// A page pinned to an instant reconnects here with ?as_of=, and this is
+	// where "live polling stops while the view is pinned" is actually enforced
+	// rather than promised: the pinned stream never subscribes to the hub at
+	// all, so no delta can reach it, and the past it was handed cannot be
+	// overwritten by something written since.
+	//
+	// Per connection rather than per server, and that is the load-bearing
+	// part. Pinning is one reader's decision, and a switch on the server would
+	// mean one person looking at last Tuesday froze the page of everybody else
+	// watching today. The poll keeps running; this stream simply does not
+	// listen to it.
+	//
+	// The connection is held open rather than closed after the frame, so the
+	// page's badge stays out of "reconnecting" — a pinned view is not a broken
+	// one — and so releasing the pin is a reconnect the page controls rather
+	// than a retry the browser schedules.
+	if raw := r.URL.Query().Get("as_of"); strings.TrimSpace(raw) != "" {
+		open := s.pinnedPayload(r.Context(), raw)
+		if !writeSSE(w, flusher, "snapshot", open) {
+			return
+		}
+		s.holdPinned(w, flusher, r)
+		return
+	}
+
+	ch, snap, backlog := s.hub.subscribe()
+	defer s.hub.unsubscribe(ch)
+
+	// The opening frame is the whole graph, taken with the subscription under
+	// one lock, so the page starts from a state no update can have slipped past.
+	open := Payload{
+		Version:  snap.Version,
+		Nodes:    snap.Nodes,
+		Edges:    snap.Edges,
+		Events:   backlog,
+		Source:   s.src.Describe,
+		Activity: s.activity,
+		Interval: s.interval.Milliseconds(),
+		Grades:   s.src.Grades,
+		Records:  s.src.Record != nil,
+		Temporal: s.src.ReadAsOf != nil,
+		Explore:  s.src.Call != nil,
+	}
+	if !writeSSE(w, flusher, "snapshot", open) {
+		return
+	}
+
+	// Without traffic a stream looks identical to a dead one, to the browser
+	// and to anything between. The heartbeat is what keeps a quiet brain from
+	// being mistaken for a broken connection.
+	beat := time.NewTicker(20 * time.Second)
+	defer beat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-beat.C:
+			if !writeSSE(w, flusher, "ping", map[string]int64{"at": time.Now().UnixMilli()}) {
+				return
+			}
+		case msg, alive := <-ch:
+			if !alive {
+				return
+			}
+			switch {
+			case msg.Delta != nil:
+				if !writeSSE(w, flusher, "delta", msg.Delta) {
+					return
+				}
+			case msg.Event != nil:
+				if !writeSSE(w, flusher, "activity", msg.Event) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// holdPinned keeps a pinned stream open on heartbeats alone.
+//
+// The heartbeat is the whole of it. Without traffic a stream looks identical to
+// a dead one, and a pinned page that let its connection be mistaken for broken
+// would start reconnecting — to the live graph, silently, under a banner saying
+// it was showing the past. So the connection says "still here, still nothing to
+// report", which for the past is the truth forever.
+func (s *Server) holdPinned(w http.ResponseWriter, flusher http.Flusher, r *http.Request) {
+	beat := time.NewTicker(20 * time.Second)
+	defer beat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-beat.C:
+			if !writeSSE(w, flusher, "ping", map[string]int64{"at": time.Now().UnixMilli()}) {
+				return
+			}
+		}
+	}
+}
+
+// writeSSE emits one frame, reporting whether the connection is still good.
+func writeSSE(w http.ResponseWriter, f http.Flusher, event string, v any) bool {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return true
+	}
+	// A payload with a newline in it would end the frame early and desynchronise
+	// the stream. JSON encoding already escapes them; this is the guard that
+	// says so out loud.
+	body = []byte(strings.ReplaceAll(string(body), "\n", " "))
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body); err != nil {
+		return false
+	}
+	f.Flush()
+	return true
+}
+
+// liveOnce holds the one server an MCP process serves. A second request for a
+// view returns the first one's URL rather than binding another port: the agent
+// asking twice means "show me", not "make me another".
+var (
+	onceMu sync.Mutex
+	views  = map[string]*Server{}
+)
+
+// Shared returns the process's view of the brain, starting it on first use.
+func Shared(ctx context.Context, activity bool) (*Server, error) {
+	return SharedFor(ctx, "", activity, OpenSource)
+}
+
+// SharedFor returns the process's view of one graph, keyed by name, starting it
+// on first use. The empty key is the brain.
+//
+// Keyed rather than single because a process can now be asked for more than one
+// graph, and a second request for the same one means "show me", not "make me
+// another": a view is a port and a poller, and handing out a new pair every time
+// an agent asked twice would leave a trail of them behind.
+//
+// Each view binds its own port. Only the first gets the preferred one; the rest
+// take whatever the OS gives, which is why the URL is always returned rather
+// than assumed.
+func SharedFor(ctx context.Context, key string, activity bool, open func(context.Context) (*Source, error)) (*Server, error) {
+	onceMu.Lock()
+	defer onceMu.Unlock()
+	if sv, ok := views[key]; ok {
+		return sv, nil
+	}
+	src, err := open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	port := PortFromEnv()
+	if key != "" {
+		// The preferred port belongs to the brain. A side graph asks for any
+		// free one rather than losing a race with it.
+		port = 0
+	}
+	sv, err := Start(context.WithoutCancel(ctx), src, port, DefaultInterval, activity)
+	if err != nil {
+		_ = src.Close()
+		return nil, err
+	}
+	views[key] = sv
+	return sv, nil
+}
+
+// Current returns the running view of the brain, or nil. Used by the
+// middleware, which must not start a server just because a tool was called —
+// the view exists only once someone asks to see it.
+func Current() *Server { return CurrentFor("") }
+
+// CurrentFor returns the running view of one graph, or nil.
+func CurrentFor(key string) *Server {
+	onceMu.Lock()
+	defer onceMu.Unlock()
+	return views[key]
+}
+
+func PortFromEnv() int {
+	if raw := strings.TrimSpace(os.Getenv("CORTEXDB_LIVE_PORT")); raw != "" {
+		if p, err := strconv.Atoi(raw); err == nil && p >= 0 && p <= 65535 {
+			return p
+		}
+	}
+	return DefaultPort
+}
+
+// OpenInBrowser hands the URL to the desktop.
+//
+// Errors are returned rather than ignored: a caller that claims to have opened
+// something is worse than one that says it could not and gives you the URL.
+func OpenInBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}

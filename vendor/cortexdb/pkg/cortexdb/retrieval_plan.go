@@ -1,0 +1,344 @@
+package cortexdb
+
+import (
+	"context"
+	"strings"
+
+	"github.com/liliang-cn/cortexdb/v2/pkg/core"
+)
+
+func resolveRetrievalPlan(input retrievalPlanInput) retrievalPlanResolution {
+	var existingPlan RetrievalPlan
+	if input.Plan != nil {
+		existingPlan = *input.Plan
+	}
+
+	// Folded in before the filters are merged, so everything downstream sees one spelling.
+	if strings.TrimSpace(existingPlan.Collection) != "" {
+		if existingPlan.Filters == nil {
+			existingPlan.Filters = &RetrievalFilters{}
+		}
+		if strings.TrimSpace(existingPlan.Filters.Collection) == "" {
+			existingPlan.Filters.Collection = strings.TrimSpace(existingPlan.Collection)
+		}
+	}
+
+	plan := RetrievalPlan{
+		Query:            firstNonEmpty(input.Query, existingPlan.Query),
+		Keywords:         mergeUniqueStrings(input.Keywords, existingPlan.Keywords),
+		AlternateQueries: mergeUniqueStrings(input.AlternateQueries, existingPlan.AlternateQueries),
+		EntityNames:      mergeUniqueStrings(input.EntityNames, existingPlan.EntityNames),
+		RetrievalMode:    normalizeRetrievalMode(firstNonEmpty(input.RetrievalMode, existingPlan.RetrievalMode)),
+		Filters:          mergeRetrievalFilters(existingPlan.Filters, input.Filters),
+	}
+
+	decision := resolveRetrievalDecision(
+		plan.RetrievalMode,
+		input.DisableGraph,
+		plan.Query,
+		plan.EntityNames,
+		input.SupportsGraph,
+		input.EmptyQueryUsesGraph,
+		input.UnsupportedEffectiveMode,
+		input.UnsupportedReason,
+		input.PreferSemantic,
+		input.GraphRequiresEntityNames,
+	)
+
+	return retrievalPlanResolution{
+		Plan:     plan,
+		Decision: decision,
+	}
+}
+
+func normalizeRetrievalMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", RetrievalModeAuto:
+		return RetrievalModeAuto
+	case RetrievalModeLexical:
+		return RetrievalModeLexical
+	case RetrievalModeGraph:
+		return RetrievalModeGraph
+	case RetrievalModePPR:
+		return RetrievalModePPR
+	default:
+		return RetrievalModeAuto
+	}
+}
+
+func resolveRetrievalDecision(mode string, disableGraph bool, query string, entityNames []string, supportsGraph bool, emptyQueryUsesGraph bool, unsupportedEffectiveMode string, unsupportedReason string, preferSemantic bool, graphRequiresEntityNames bool) RetrievalDecision {
+	requested := normalizeRetrievalMode(mode)
+	decision := RetrievalDecision{
+		RequestedMode: requested,
+		EffectiveMode: requested,
+	}
+
+	if disableGraph {
+		decision.EffectiveMode = RetrievalModeLexical
+		decision.Reason = "graph disabled by request"
+		return decision
+	}
+
+	if !supportsGraph {
+		effective := normalizeRetrievalMode(unsupportedEffectiveMode)
+		if requested == RetrievalModeLexical {
+			effective = RetrievalModeLexical
+		}
+		if effective == RetrievalModeGraph {
+			effective = RetrievalModeAuto
+		}
+		if effective == "" {
+			effective = RetrievalModeLexical
+		}
+		decision.EffectiveMode = effective
+		if requested == RetrievalModeGraph {
+			decision.Reason = "graph mode requested, but this API does not use graph expansion"
+		} else {
+			decision.Reason = firstNonEmpty(unsupportedReason, "this API does not use graph expansion")
+		}
+		return decision
+	}
+
+	switch requested {
+	case RetrievalModeLexical:
+		decision.EffectiveMode = RetrievalModeLexical
+		decision.Reason = "lexical mode requested"
+	case RetrievalModeGraph:
+		decision.EffectiveMode = RetrievalModeGraph
+		decision.UseGraph = true
+		decision.Reason = "graph mode requested explicitly"
+	case RetrievalModePPR:
+		// UseGraph stays true so a path that has no walk of its own still
+		// treats ppr as a graph mode and expands, rather than quietly
+		// answering lexically; the knowledge and memory searches intercept it.
+		decision.EffectiveMode = RetrievalModePPR
+		decision.UseGraph = true
+		decision.Reason = "personalized PageRank requested explicitly"
+	default:
+		if len(entityNames) > 0 {
+			decision.EffectiveMode = RetrievalModeGraph
+			decision.UseGraph = true
+			decision.Reason = "auto mode used graph because entity_names were provided"
+			return decision
+		}
+		if strings.TrimSpace(query) == "" {
+			if emptyQueryUsesGraph {
+				decision.EffectiveMode = RetrievalModeGraph
+				decision.UseGraph = true
+				decision.Reason = "auto mode used graph because chunk enrichment was requested without query text"
+			} else {
+				decision.EffectiveMode = RetrievalModeLexical
+				decision.Reason = "auto mode stayed lexical because no entity signal was found"
+			}
+			return decision
+		}
+		if !graphRequiresEntityNames && len(extractEntityNames(extractTitleEntities(query))) > 0 {
+			decision.EffectiveMode = RetrievalModeGraph
+			decision.UseGraph = true
+			decision.Reason = "auto mode detected entity-like terms in the query"
+			return decision
+		}
+		if preferSemantic {
+			// Keep a non-lexical effective mode so the caller routes to vector
+			// (semantic) retrieval; auto silently falling back to lexical made a
+			// configured embedder useless on the knowledge path.
+			decision.EffectiveMode = RetrievalModeAuto
+			decision.Reason = "auto mode used semantic vector search because an embedder is available"
+		} else {
+			decision.EffectiveMode = RetrievalModeLexical
+			decision.Reason = "auto mode stayed lexical because no entity signal was found"
+		}
+	}
+
+	return decision
+}
+
+// autoUsesWalk turns auto's graph choice into the personalized PageRank walk
+// on a knowledge search without an embedder.
+//
+// Auto picks graph whenever the query names an entity, which is nearly every
+// natural-language question. Without an embedder the walk is the better graph
+// retrieval on every set measured, and since pprFusionRRFK it no longer costs
+// a single-hop question its lexical answer (supporting-passage recall@5 on
+// held-out questions, ppr_bench_test.go). Graph mode itself stays what it
+// says, fixed-hop expansion, for callers who ask for it by name.
+//
+// With an embedder, auto keeps vector+lexical hybrid. The walk measured
+// better there too on multi-hop questions (2Wiki recall@5 0.832 against
+// auto's 0.652 with embeddinggemma), but its hybrid first stage costs about
+// three times hybrid's latency and single-hop with an embedder is not yet
+// measured, so with an embedder it stays something to ask for.
+func autoUsesWalk(decision *RetrievalDecision, hasEmbedder bool) {
+	if hasEmbedder || decision.RequestedMode != RetrievalModeAuto || decision.EffectiveMode != RetrievalModeGraph {
+		return
+	}
+	decision.EffectiveMode = RetrievalModePPR
+	decision.UseGraph = true
+	decision.Reason = "auto mode walked the entity graph (personalized PageRank) because the query names entities and no embedder is configured"
+}
+
+func shouldUseGraphRetrieval(mode string, disableGraph bool, query string, entityNames []string) bool {
+	return resolveRetrievalDecision(mode, disableGraph, query, entityNames, true, false, RetrievalModeLexical, "", false, false).UseGraph
+}
+
+func shouldLoadChunkEntities(mode string, disableGraph bool, query string) bool {
+	return resolveRetrievalDecision(mode, disableGraph, query, nil, true, true, RetrievalModeLexical, "", false, false).UseGraph
+}
+
+func mergeRetrievalFilters(base, override *RetrievalFilters) *RetrievalFilters {
+	if base == nil && override == nil {
+		return nil
+	}
+
+	merged := RetrievalFilters{}
+	if base != nil {
+		merged.Collection = strings.TrimSpace(base.Collection)
+		merged.DocumentIDs = mergeUniqueStrings(base.DocumentIDs)
+		merged.UserID = strings.TrimSpace(base.UserID)
+		merged.SessionID = strings.TrimSpace(base.SessionID)
+		merged.Scope = strings.TrimSpace(base.Scope)
+		merged.Namespace = strings.TrimSpace(base.Namespace)
+		merged.ReviewStatus = strings.TrimSpace(base.ReviewStatus)
+	}
+	if override != nil {
+		if value := strings.TrimSpace(override.Collection); value != "" {
+			merged.Collection = value
+		}
+		merged.DocumentIDs = mergeUniqueStrings(override.DocumentIDs, merged.DocumentIDs)
+		if value := strings.TrimSpace(override.UserID); value != "" {
+			merged.UserID = value
+		}
+		if value := strings.TrimSpace(override.SessionID); value != "" {
+			merged.SessionID = value
+		}
+		if value := strings.TrimSpace(override.Scope); value != "" {
+			merged.Scope = value
+		}
+		if value := strings.TrimSpace(override.Namespace); value != "" {
+			merged.Namespace = value
+		}
+		if value := strings.TrimSpace(override.ReviewStatus); value != "" {
+			merged.ReviewStatus = value
+		}
+	}
+	if retrievalFiltersEmpty(merged) {
+		return nil
+	}
+	return &merged
+}
+
+func retrievalFiltersEmpty(filters RetrievalFilters) bool {
+	return filters.Collection == "" &&
+		len(filters.DocumentIDs) == 0 &&
+		filters.UserID == "" &&
+		filters.SessionID == "" &&
+		filters.Scope == "" &&
+		filters.Namespace == "" &&
+		filters.ReviewStatus == ""
+}
+
+func mergeUniqueStrings(groups ...[]string) []string {
+	var merged []string
+	seen := make(map[string]struct{})
+	for _, group := range groups {
+		for _, value := range group {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			merged = append(merged, value)
+		}
+	}
+	return merged
+}
+
+func applyRetrievalPlanCollection(collection string, filters *RetrievalFilters) string {
+	if value := strings.TrimSpace(collection); value != "" {
+		return value
+	}
+	if filters == nil {
+		return ""
+	}
+	return strings.TrimSpace(filters.Collection)
+}
+
+// filterScoredEmbeddings keeps the hits whose document the filters allow and
+// that has not expired. It is the vector path's counterpart of the check the
+// lexical and graph paths make per chunk: before it asked allowDocument, a
+// hybrid search seeded from the vector index returned an expired document
+// that the same search in lexical mode left out.
+func (db *DB) filterScoredEmbeddings(ctx context.Context, results []core.ScoredEmbedding, filters *RetrievalFilters) []core.ScoredEmbedding {
+	ids := make([]string, 0, len(results))
+	for _, result := range results {
+		ids = append(ids, result.DocID)
+	}
+	hidden := db.hiddenAmong(ctx, filters, ids)
+	filtered := make([]core.ScoredEmbedding, 0, len(results))
+	for _, result := range results {
+		if allowDocument(filters, hidden, result.DocID) {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
+}
+
+// gatedSearch asks search for k hits, keeps those the document gate allows,
+// and asks again for four times as many while hidden
+// hits took places the caller asked for and the store had more to give. A
+// hidden row never takes the place of a visible one, and the answer stops
+// where the store's own does. topK <= 0 asks once with the store's default.
+// A caller's own filters run after it, on what it kept, as on main: they do
+// not make it read further.
+func (db *DB) gatedSearch(ctx context.Context, topK int, search func(k int) ([]core.ScoredEmbedding, error)) ([]core.ScoredEmbedding, error) {
+	return db.gatedSearchFor(ctx, topK, "", search)
+}
+
+// gatedSearchFor is gatedSearch under the review status a plan asks for,
+// which is part of the gate: the review gate hides the other statuses, so
+// the refill counts them as hidden. The plan's other filters still run
+// after it.
+func (db *DB) gatedSearchFor(ctx context.Context, topK int, reviewStatus string, search func(k int) ([]core.ScoredEmbedding, error)) ([]core.ScoredEmbedding, error) {
+	var gate *RetrievalFilters
+	if reviewStatus != "" {
+		gate = &RetrievalFilters{ReviewStatus: reviewStatus}
+	}
+	k := topK
+	for {
+		raw, err := search(k)
+		if err != nil {
+			return nil, err
+		}
+		kept := db.filterScoredEmbeddings(ctx, raw, gate)
+		if topK <= 0 || len(kept) >= topK || len(raw) < k {
+			if topK > 0 && len(kept) > topK {
+				kept = kept[:topK]
+			}
+			return kept, nil
+		}
+		k *= 4
+	}
+}
+
+func allowDocumentID(filters *RetrievalFilters, documentID string) bool {
+	if filters == nil || len(filters.DocumentIDs) == 0 {
+		return true
+	}
+	for _, candidate := range filters.DocumentIDs {
+		if candidate == documentID {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewStatusOf is the review status a plan's filters ask for, or "".
+func reviewStatusOf(filters *RetrievalFilters) string {
+	if filters == nil {
+		return ""
+	}
+	return filters.ReviewStatus
+}

@@ -1,0 +1,27 @@
+{
+  "enabledMcpjsonServers": ["xerj", "cortexdb"],
+  "permissions": {
+    "allow": [
+      "mcp__xerj__xerj_map",
+      "mcp__xerj__xerj_plan",
+      "mcp__xerj__xerj_def",
+      "mcp__xerj__xerj_search",
+      "mcp__xerj__xerj_batch_search",
+      "mcp__xerj__xerj_hybrid_search",
+      "mcp__xerj__xerj_semantic_search",
+      "mcp__xerj__xerj_code_search",
+      "mcp__cortexdb__knowledge_search",
+      "mcp__cortexdb__knowledge_graph_query",
+      "mcp__cortexdb__build_context",
+      "mcp__cortexdb__knowledge_save",
+      "mcp__cortexdb__knowledge_graph_upsert",
+      "mcp__cortexdb__knowledge_graph_shacl_validate",
+      "Bash(scripts/subir_xerj.sh:*)",
+      "Bash(scripts/verificar_isolamento.sh)"
+    ],
+    "deny": [
+      "WebFetch",
+      "WebSearch"
+    ]
+  }
+}
