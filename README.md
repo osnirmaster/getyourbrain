@@ -34,11 +34,15 @@ A sessão principal do Claude Code faz o papel de orquestrador, seguindo `/pergu
 
 ## Instalação
 
-Precisa de Rust (`cargo`), Go e Claude Code.
+Precisa de Rust (`cargo`), Go 1.25+ e Claude Code.
 
 ```bash
-scripts/build.sh   # compila xerj e cortexdb em bin/ e roda a verificação de isolamento
+./instalar.sh                         # confere pré-requisitos, compila, verifica o isolamento e sobe o xerj
+./instalar.sh ~/repos/pix ~/docs/pix  # o mesmo e já indexa as pastas
+./instalar.sh --recompilar            # recompila mesmo com bin/ pronto
 ```
+
+O instalador também cria `saida/` e um `temas.txt` a partir de `temas.exemplo.txt`. Só para recompilar, use `scripts/build.sh`.
 
 A primeira compilação do xerj leva cerca de 10 minutos. As dependências vêm do crates.io e do proxy do Go, travadas por `Cargo.lock` e `go.sum`. Depois de compilado, nada mais acessa a rede.
 
